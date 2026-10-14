@@ -105,6 +105,10 @@ interface DataStoreManager {
 
     suspend fun setSaveRecentSongAndQueue(save: Boolean)
 
+    val autoDownloadPlayedSongs: Flow<String>
+
+    suspend fun setAutoDownloadPlayedSongs(enabled: Boolean)
+
     val recentMediaId: Flow<String>
     val recentPosition: Flow<String>
 

@@ -28,3 +28,6 @@ replay_pid*
 
 # OMC (oh-my-claudecode) local state
 /.omc/
+# Gradle/Kotlin JVM build output dirs (Windows)
+/media/media-jvm/bin/
+/media/media-jvm-ui/bin/

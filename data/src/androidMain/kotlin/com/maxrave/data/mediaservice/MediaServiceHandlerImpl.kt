@@ -139,6 +139,8 @@ internal class MediaServiceHandlerImpl(
      * and all three actuals for one dependency.
      */
     private val lastfmScrobbler = LastfmScrobbler(dataStoreManager)
+    private val autoMusicExporter by lazy { AutoMusicExporter(context, dataStoreManager, streamRepository) }
+    private var lastAutoExportedVideoId: String? = null
     override var onUpdateNotification: (List<GenericCommandButton>) -> Unit = {}
     override var showToast: (ToastType) -> Unit = {}
     override var pushPlayerError: (PlayerError) -> Unit = {}
@@ -972,7 +974,8 @@ internal class MediaServiceHandlerImpl(
                 var sinceLastPositionSaveMs = 0L
                 while (true) {
                     delay(tickIntervalMs)
-                    _simpleMediaState.value = SimpleMediaState.Progress(player.currentPosition)
+                    val currentPos = player.currentPosition
+                    _simpleMediaState.value = SimpleMediaState.Progress(currentPos)
                     sinceLastPositionSaveMs += tickIntervalMs
                     if (sinceLastPositionSaveMs >= positionPersistIntervalMs) {
                         sinceLastPositionSaveMs = 0
@@ -980,7 +983,17 @@ internal class MediaServiceHandlerImpl(
                         // Riding the existing 5s tick instead of adding one: the scrobble point is
                         // half the track or four minutes, so five seconds of granularity is plenty
                         // and the 100ms loop stays as cheap as it was.
-                        lastfmScrobbler.onProgress(player.currentPosition)
+                        lastfmScrobbler.onProgress(currentPos)
+                    }
+                    // Trigger auto-download to Music/SimpMusic once track has actively played for >= 7 seconds (avoids fast skips)
+                    if (currentPos >= 7_000L) {
+                        val currentSong = nowPlayingState.value.songEntity
+                        if (currentSong != null && currentSong.videoId != lastAutoExportedVideoId) {
+                            lastAutoExportedVideoId = currentSong.videoId
+                            backgroundScope.launch {
+                                autoMusicExporter.exportTrackIfEligible(currentSong)
+                            }
+                        }
                     }
                 }
             }

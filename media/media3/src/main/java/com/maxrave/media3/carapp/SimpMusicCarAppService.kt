@@ -131,15 +131,18 @@ internal class SimpMusicCarSession : Session() {
                 resultFuture.addListener({
                     runCatching {
                         val result = resultFuture.get()
+                        val extras = result.extras
+                        extras.classLoader = android.media.session.MediaSession.Token::class.java.classLoader
                         val platformToken =
                             BundleCompat.getParcelable(
-                                result.extras,
+                                extras,
                                 MEDIA_CUSTOM_COMMAND.KEY_PLATFORM_TOKEN,
                                 android.media.session.MediaSession.Token::class.java,
                             )
                         if (result.resultCode == SessionResult.RESULT_SUCCESS && platformToken != null) {
                             (carContext.getCarService(CarContext.MEDIA_PLAYBACK_SERVICE) as MediaPlaybackManager)
                                 .registerMediaPlaybackToken(MediaSessionCompat.Token.fromToken(platformToken))
+                            Logger.i(TAG, "Successfully registered MediaPlaybackToken with CarContext")
                         } else {
                             Logger.e(TAG, "Platform token missing from ${MEDIA_CUSTOM_COMMAND.GET_PLATFORM_TOKEN} result")
                         }

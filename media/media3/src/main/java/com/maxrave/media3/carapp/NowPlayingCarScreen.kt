@@ -45,6 +45,9 @@ internal class NowPlayingCarScreen(
         screenScope.launch {
             handler.queueData.collect { invalidate() }
         }
+        screenScope.launch {
+            handler.nowPlaying.collect { invalidate() }
+        }
     }
 
     override fun onGetTemplate(): Template {

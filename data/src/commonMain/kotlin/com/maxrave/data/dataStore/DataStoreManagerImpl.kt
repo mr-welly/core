@@ -359,6 +359,19 @@ internal class DataStoreManagerImpl(
         }
     }
 
+    override val autoDownloadPlayedSongs: Flow<String> =
+        settingsDataStore.data.map { preferences ->
+            preferences[AUTO_DOWNLOAD_PLAYED_SONGS] ?: TRUE
+        }
+
+    override suspend fun setAutoDownloadPlayedSongs(enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[AUTO_DOWNLOAD_PLAYED_SONGS] = if (enabled) TRUE else FALSE
+            }
+        }
+    }
+
     override val recentMediaId =
         settingsDataStore.data.map { preferences ->
             preferences[RECENT_SONG_MEDIA_ID_KEY] ?: ""
@@ -1813,6 +1826,7 @@ internal class DataStoreManagerImpl(
         val CROSSFADE_DJ_MODE = stringPreferencesKey("crossfade_dj_mode")
         val CROSSFADE_SKIP_ALBUM = stringPreferencesKey("crossfade_skip_album")
         val AUTO_DOWNLOAD_LIKED_SONGS = stringPreferencesKey("auto_download_liked_songs")
+        val AUTO_DOWNLOAD_PLAYED_SONGS = stringPreferencesKey("auto_download_played_songs")
         val LYRICS_PROVIDER = stringPreferencesKey("lyrics_provider")
         val TRANSLATION_LANGUAGE = stringPreferencesKey("translation_language")
         val USE_TRANSLATION_LANGUAGE = stringPreferencesKey("use_translation_language")

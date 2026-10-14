@@ -120,6 +120,7 @@ kotlin {
                 implementation(libs.room.ktx)
                 // Login sync: the phone sends sign-ins to the Desktop
                 implementation(projects.loginSync)
+                implementation(libs.ffmpeg.kit.audio)
             }
         }
 
