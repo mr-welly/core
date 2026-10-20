@@ -8,7 +8,7 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class YouTubeInitialPage(
     @SerialName("videoDetails")
-    val videoDetails: VideoDetails?,
+    val videoDetails: VideoDetails? = null,
     @SerialName("captions")
     val captions: Captions? = null,
 ) {

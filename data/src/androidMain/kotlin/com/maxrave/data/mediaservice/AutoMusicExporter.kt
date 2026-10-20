@@ -15,6 +15,7 @@ import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.logger.Logger
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.lastOrNull
@@ -42,10 +43,19 @@ class AutoMusicExporter(
         private const val MUSIC_SUBDIR = "SimpMusic"
         private const val CONNECT_TIMEOUT_MS = 30_000
         private const val READ_TIMEOUT_MS = 60_000
+        private const val MAX_DOWNLOAD_ATTEMPTS = 3
+        private const val RETRY_BASE_DELAY_MS = 3_000L
     }
 
     private val mutex = Mutex()
     private val processedOrQueuedVideoIds = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Tracks how many download attempts a track has already burned. A track is only dropped from
+     * [processedOrQueuedVideoIds] when it is permanently finished - saved, or out of retries - so a
+     * transient failure no longer blocks it for the rest of the session.
+     */
+    private val downloadAttemptCounts = ConcurrentHashMap<String, Int>()
     private var loggedTargetVolume = false
 
     suspend fun exportTrackIfEligible(song: SongEntity) = withContext(Dispatchers.IO) {
@@ -66,16 +76,41 @@ class AutoMusicExporter(
         }
 
         mutex.withLock {
-            try {
-                processTrackExport(song)
-            } catch (e: Exception) {
-                Logger.e(TAG, "Error exporting track ${song.title}: ${e.message}")
-                e.printStackTrace()
+            var attempt = 1
+            while (attempt <= MAX_DOWNLOAD_ATTEMPTS) {
+                try {
+                    val exported = processTrackExport(song)
+                    if (exported) {
+                        downloadAttemptCounts.remove(videoId)
+                        return@withLock
+                    }
+                    Logger.w(
+                        TAG,
+                        "Export attempt $attempt/$MAX_DOWNLOAD_ATTEMPTS failed for ${song.title}",
+                    )
+                } catch (e: Exception) {
+                    Logger.e(TAG, "Error exporting track ${song.title} (attempt $attempt): ${e.message}")
+                }
+
+                if (attempt < MAX_DOWNLOAD_ATTEMPTS) {
+                    // Exponential backoff: 3s, 6s. YouTube resets connections when a stream is
+                    // re-requested too quickly, so spacing the retries out is the point.
+                    val backoff = RETRY_BASE_DELAY_MS * attempt
+                    Logger.d(TAG, "Retrying ${song.title} in ${backoff}ms")
+                    delay(backoff)
+                }
+                attempt++
             }
+
+            // Out of retries: let this track be reconsidered next time it is played, rather than
+            // staying blocked for the rest of the session.
+            downloadAttemptCounts[videoId] = MAX_DOWNLOAD_ATTEMPTS
+            processedOrQueuedVideoIds.remove(videoId)
+            Logger.e(TAG, "Giving up on ${song.title} after $MAX_DOWNLOAD_ATTEMPTS attempts")
         }
     }
 
-    private suspend fun processTrackExport(song: SongEntity) {
+    private suspend fun processTrackExport(song: SongEntity): Boolean {
         val artist = song.artistName?.joinToString(", ")?.ifBlank { "Unknown Artist" } ?: "Unknown Artist"
         val title = song.title.ifBlank { "Unknown Title" }
         val album = song.albumName?.ifBlank { title } ?: title
@@ -86,7 +121,7 @@ class AutoMusicExporter(
         // Check if file already exists in Music/SimpMusic
         if (checkFileExists(targetFileName)) {
             Logger.i(TAG, "Track already exists in Music/$MUSIC_SUBDIR: $targetFileName. Skipping download.")
-            return
+            return true
         }
 
         Logger.i(TAG, "Starting auto-export for: $targetFileName (videoId: ${song.videoId})")
@@ -114,7 +149,7 @@ class AutoMusicExporter(
 
         if (audioUrl.isNullOrEmpty()) {
             Logger.e(TAG, "Could not resolve audio stream URL for ${song.videoId}")
-            return
+            return false
         }
 
         // 2. Prepare temporary directory and files
@@ -133,7 +168,7 @@ class AutoMusicExporter(
             val downloadedAudio = downloadToFile(audioUrl, tempRawAudio)
             if (!downloadedAudio) {
                 Logger.e(TAG, "Failed downloading raw audio for ${song.title}")
-                return
+                return false
             }
 
             // 4. Download album cover art thumbnail if available
@@ -191,7 +226,7 @@ class AutoMusicExporter(
 
             if (!ReturnCode.isSuccess(session.returnCode) || !tempEncodedMp3.exists() || tempEncodedMp3.length() == 0L) {
                 Logger.e(TAG, "FFmpeg encoding failed: code=${session.returnCode}, state=${session.state}")
-                return
+                return false
             }
 
             // 6. Save resulting MP3 to MediaStore / Music/SimpMusic
@@ -204,6 +239,7 @@ class AutoMusicExporter(
             )
 
             Logger.i(TAG, "Successfully auto-downloaded and saved: $targetFileName to Music/$MUSIC_SUBDIR")
+            return true
         } finally {
             // Clean up scratch files
             if (tempRawAudio.exists()) tempRawAudio.delete()
