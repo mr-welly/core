@@ -263,8 +263,10 @@ internal class SimpleMediaSessionCallback(
                     when (resource) {
                         is Resource.Success -> {
                             resource.data?.let {
-                                searchTempList.clear()
-                                searchTempList.addAll(it.toListTrack())
+                                synchronized(searchTempList) {
+                                    searchTempList.clear()
+                                    searchTempList.addAll(it.toListTrack())
+                                }
                             }
                             resource.data
                         }
@@ -290,8 +292,9 @@ internal class SimpleMediaSessionCallback(
         params: MediaLibraryService.LibraryParams?,
     ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
         scope.future(Dispatchers.IO) {
+            val list = synchronized(searchTempList) { searchTempList.toList() }
             LibraryResult.ofItemList(
-                searchTempList.map {
+                list.map {
                     it.toMediaItemWithoutPath()
                 },
                 params,
@@ -608,10 +611,23 @@ internal class SimpleMediaSessionCallback(
             when (path.firstOrNull()) {
                 SONG -> {
                     val songId = path.getOrNull(1) ?: return@future defaultResult
-                    val firstQueue = songRepository.getSongById(songId).first()?.toTrack() ?: return@future defaultResult
+                    val searchTracks = synchronized(searchTempList) { searchTempList.toList() }
+                    val firstQueue =
+                        searchTracks.firstOrNull { it.videoId == songId }
+                            ?: songRepository.getSongById(songId).firstOrNull()?.toTrack()
+                            ?: streamRepository.getFullMetadata(songId).lastOrNull()?.data
+                            ?: return@future defaultResult
+                    songRepository.insertSong(firstQueue.toSongEntity()).firstOrNull()
+                    val listTracks =
+                        if (searchTracks.any { it.videoId == songId }) {
+                            ArrayList(searchTracks)
+                        } else {
+                            arrayListOf(firstQueue)
+                        }
+                    val index = listTracks.indexOfFirst { it.videoId == songId }.coerceAtLeast(0)
                     mediaPlayerHandler.setQueueData(
                         QueueData.Data(
-                            listTracks = arrayListOf(firstQueue),
+                            listTracks = listTracks,
                             firstPlayedTrack = firstQueue,
                             playlistId = "RDAMVM$songId",
                             playlistName = "\"${firstQueue.title}\" Radio",
@@ -622,9 +638,13 @@ internal class SimpleMediaSessionCallback(
                     mediaPlayerHandler.loadMediaItem(
                         firstQueue,
                         Config.SONG_CLICK,
-                        0,
+                        index,
                     )
-                    defaultResult
+                    MediaSession.MediaItemsWithStartPosition(
+                        listOf(firstQueue.toMediaItem()),
+                        0,
+                        startPositionMs,
+                    )
                 }
 
                 FAVORITE -> {
@@ -898,6 +918,44 @@ internal class SimpleMediaSessionCallback(
                 }
 
                 else -> {
+                    val songId = path.firstOrNull()
+                    if (!songId.isNullOrBlank() && songId != ROOT) {
+                        val searchTracks = synchronized(searchTempList) { searchTempList.toList() }
+                        val firstQueue =
+                            searchTracks.firstOrNull { it.videoId == songId }
+                                ?: songRepository.getSongById(songId).firstOrNull()?.toTrack()
+                                ?: streamRepository.getFullMetadata(songId).lastOrNull()?.data
+                        if (firstQueue != null) {
+                            songRepository.insertSong(firstQueue.toSongEntity()).firstOrNull()
+                            val listTracks =
+                                if (searchTracks.any { it.videoId == songId }) {
+                                    ArrayList(searchTracks)
+                                } else {
+                                    arrayListOf(firstQueue)
+                                }
+                            val index = listTracks.indexOfFirst { it.videoId == songId }.coerceAtLeast(0)
+                            mediaPlayerHandler.setQueueData(
+                                QueueData.Data(
+                                    listTracks = listTracks,
+                                    firstPlayedTrack = firstQueue,
+                                    playlistId = "RDAMVM$songId",
+                                    playlistName = "\"${firstQueue.title}\" Radio",
+                                    playlistType = PlaylistType.RADIO,
+                                    continuation = null,
+                                ),
+                            )
+                            mediaPlayerHandler.loadMediaItem(
+                                firstQueue,
+                                Config.SONG_CLICK,
+                                index,
+                            )
+                            return@future MediaSession.MediaItemsWithStartPosition(
+                                listOf(firstQueue.toMediaItem()),
+                                0,
+                                startPositionMs,
+                            )
+                        }
+                    }
                     defaultResult
                 }
             }
@@ -939,6 +997,8 @@ internal class SimpleMediaSessionCallback(
         MediaItem
             .Builder()
             .setMediaId("$path/${this.videoId}")
+            .setUri(this.videoId)
+            .setCustomCacheKey(this.videoId)
             .setMediaMetadata(
                 MediaMetadata
                     .Builder()
@@ -956,6 +1016,8 @@ internal class SimpleMediaSessionCallback(
         MediaItem
             .Builder()
             .setMediaId(if (path == null) this.videoId else "$path/${this.videoId}")
+            .setUri(this.videoId)
+            .setCustomCacheKey(this.videoId)
             .setMediaMetadata(
                 MediaMetadata
                     .Builder()
