@@ -65,7 +65,7 @@ internal class HomeRepositoryImpl(
         params: String?,
         viewString: String,
         songString: String,
-    ): Flow<Resource<Pair<String?, List<HomeItem>>>> =
+    ): Flow<Resource<Triple<String?, List<HomeItem>, String?>>> =
         flow {
             runCatching {
                 val limit = dataStoreManager.homeLimit.first()
@@ -203,9 +203,10 @@ internal class HomeRepositoryImpl(
 //                                }
 //                        }
                         Logger.d("Repository", "List size: ${list.size}")
-                        emit(Resource.Success(continueParam to list.toList()))
+                        val background = result.background?.musicThumbnailRenderer?.getThumbnailUrl()
+                        emit(Resource.Success(Triple(continueParam, list.toList(), background)))
                     }.onFailure { error ->
-                        emit(Resource.Error<Pair<String?, List<HomeItem>>>(error.message.toString()))
+                        emit(Resource.Error<Triple<String?, List<HomeItem>, String?>>(error.message.toString()))
                     }
             }
         }.flowOn(Dispatchers.IO)
@@ -407,10 +408,11 @@ internal class HomeRepositoryImpl(
     override fun getBrowsePage(
         browseId: String,
         params: String?,
+        songString: String,
     ): Flow<Resource<BrowsePage>> =
         flow {
             youTube
-                .browse(browseId = browseId, params = params)
+                .browse(browseId = browseId, params = params, songString = songString)
                 .onSuccess { result ->
                     emit(
                         Resource.Success(
