@@ -2,10 +2,14 @@ package com.maxrave.domain.mediaservice.player
 
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
+import com.maxrave.domain.data.player.EightDEffect
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+
+/** How many waveform bars [MediaPlayerInterface.loadWaveform] returns per second of audio. */
+const val WAVEFORM_BARS_PER_SECOND = 1.25f
 
 /**
  * Abstract interface for media player implementations
@@ -204,6 +208,13 @@ interface MediaPlayerInterface {
      */
     fun setAudioEffects(effects: AudioEffects) = Unit
 
+    /** Independent of EQ/echo/reverb. Null bypasses 8D without changing its saved controls. */
+    fun setEightD(effect: EightDEffect?) = Unit
+
+    /** A rejected native filter disables only the 8D controls, never the rest of playback. */
+    val eightDAvailable: StateFlow<Boolean>
+        get() = NO_EIGHT_D
+
     /**
      * The outputs this player can render into right now, with the one the sound is leaving by
      * marked [AudioOutput.isActive].
@@ -234,6 +245,21 @@ interface MediaPlayerInterface {
      */
     fun refreshAudioOutputs() = Unit
 
+    /**
+     * The loudness outline of [mediaId]'s audio for the SoundCloud style's waveform: one value per
+     * 1 / [WAVEFORM_BARS_PER_SECOND] seconds of the track, each 0..1 against the track's loudest
+     * moment. Null when this backend cannot produce one (the default) or the audio could not be read.
+     *
+     * [onProgress] receives immutable snapshots as decoded audio becomes available. Zero slots mark
+     * undecoded ranges, e.g. after a seek. Android observes the active player's PCM until cancelled;
+     * a completed disk cache can return immediately. Desktop can return its completed measurement.
+     * Partial previews must not be saved as completed waveforms. Callbacks stop before return.
+     */
+    suspend fun loadWaveform(
+        mediaId: String,
+        onProgress: (FloatArray) -> Unit = {},
+    ): FloatArray? = null
+
     // Listener management
     fun addListener(listener: MediaPlayerListener)
 
@@ -245,3 +271,4 @@ interface MediaPlayerInterface {
 
 // What a backend that cannot list its outputs reports: nothing, and never anything else.
 private val NO_AUDIO_OUTPUTS: StateFlow<List<AudioOutput>> = MutableStateFlow(emptyList())
+private val NO_EIGHT_D: StateFlow<Boolean> = MutableStateFlow(false)

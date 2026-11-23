@@ -1,6 +1,8 @@
 package com.maxrave.domain.manager
 
+import com.maxrave.domain.data.model.discord.DiscordSession
 import com.maxrave.domain.data.model.network.ProxyConfiguration
+import com.maxrave.domain.data.player.EightDDirection
 import com.maxrave.domain.data.player.ReverbPreset
 import kotlinx.coroutines.flow.Flow
 
@@ -286,6 +288,19 @@ interface DataStoreManager {
 
     suspend fun setReverbMix(mix: Float)
 
+    val eightDEnabled: Flow<String>
+
+    suspend fun setEightDEnabled(enabled: Boolean)
+
+    val eightDDirection: Flow<String>
+
+    suspend fun setEightDDirection(direction: EightDDirection)
+
+    /** Seconds per full revolution, 3..30 in 0.5-second increments. */
+    val eightDPeriodSeconds: Flow<Float>
+
+    suspend fun setEightDPeriodSeconds(seconds: Float)
+
     val syncFollowToYouTube: Flow<String>
 
     suspend fun setSyncFollowToYouTube(enabled: Boolean)
@@ -534,7 +549,7 @@ interface DataStoreManager {
 
     suspend fun setCustomThemeColor(argbHex: String)
 
-    /** One of [NOW_PLAYING_STYLE_SPOTIFY], [NOW_PLAYING_STYLE_M3_EXPRESSIVE], [NOW_PLAYING_STYLE_APPLE_MUSIC]. */
+    /** One of [NOW_PLAYING_STYLE_SPOTIFY], [NOW_PLAYING_STYLE_M3_EXPRESSIVE], [NOW_PLAYING_STYLE_APPLE_MUSIC], [NOW_PLAYING_STYLE_SOUNDCLOUD]. */
     val nowPlayingStyle: Flow<String>
 
     suspend fun setNowPlayingStyle(style: String)
@@ -586,6 +601,11 @@ interface DataStoreManager {
     val discordToken: Flow<String>
 
     suspend fun setDiscordToken(token: String)
+
+    /** The OAuth login used by Full builds; null when logged out. */
+    val discordSession: Flow<DiscordSession?>
+
+    suspend fun setDiscordSession(session: DiscordSession?)
 
     val richPresenceEnabled: Flow<String>
 
@@ -666,6 +686,7 @@ interface DataStoreManager {
         const val NOW_PLAYING_STYLE_SPOTIFY = "SPOTIFY"
         const val NOW_PLAYING_STYLE_M3_EXPRESSIVE = "M3_EXPRESSIVE"
         const val NOW_PLAYING_STYLE_APPLE_MUSIC = "APPLE_MUSIC"
+        const val NOW_PLAYING_STYLE_SOUNDCLOUD = "SOUNDCLOUD"
 
         const val LYRICS_STYLE_CLASSIC = "CLASSIC"
         const val LYRICS_STYLE_APPLE_MUSIC = "APPLE_MUSIC"

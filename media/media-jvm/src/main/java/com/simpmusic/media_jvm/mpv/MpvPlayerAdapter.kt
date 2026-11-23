@@ -5,9 +5,14 @@ import com.maxrave.domain.data.player.AppOnScreen
 import com.maxrave.domain.data.player.AudioEffects
 import com.maxrave.domain.data.player.AudioOutput
 import com.maxrave.domain.data.player.AudioOutputKind
+import com.maxrave.domain.data.player.EightDEffect
+import com.maxrave.domain.data.player.EightDOrbit
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
 import com.maxrave.domain.data.player.LiveStreamRegistry
+import com.maxrave.domain.mediaservice.automix.TrackStructure
+import com.maxrave.domain.mediaservice.automix.TransitionPlan
+import com.maxrave.domain.mediaservice.automix.TransitionPlanner
 import com.maxrave.domain.data.player.PlayerConstants
 import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.extension.isVideo
@@ -164,6 +169,11 @@ class MpvPlayerAdapter(
     @Volatile
     private var internalSleepFadeFactor = 1.0f
 
+    private val eightDOrbit = EightDOrbit()
+    private val _eightDAvailable = MutableStateFlow(true)
+    override val eightDAvailable: StateFlow<Boolean> = _eightDAvailable.asStateFlow()
+    private var eightDCleanupJob: Job? = null
+
     /**
      * Pitch shift the user asked for, 1.0 = unchanged.
      *
@@ -263,6 +273,15 @@ class MpvPlayerAdapter(
 
     // AutoMix metadata cache (in-memory, populated from Tidal via NewFormatEntity)
     private val audioMetaCache = ConcurrentHashMap<String, SongAudioMeta>()
+
+    // AutoMix structure: tempo, bars, drop and key measured from each track's own audio, and the
+    // transition placed by them (TransitionPlanner). Both fill in while the track plays.
+    private val trackStructures = ConcurrentHashMap<String, TrackStructure>()
+    private val structureAttempts = ConcurrentHashMap<String, Int>()
+    private val structureRetryAt = ConcurrentHashMap<String, Long>()
+    private var structureJob: Job? = null
+    private val transitionPlans = ConcurrentHashMap<String, TransitionPlan>()
+    private val pairsWithoutPlan: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     private fun setCrossfading(value: Boolean) {
         if (isCrossfading != value) {
@@ -603,11 +622,21 @@ class MpvPlayerAdapter(
 
         notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
 
-        if (playlist.size - 1 - currentMediaItemIndex <= maxPrecacheCount) {
-            coroutineScope.launch {
-                clearPrecacheExceptCurrentInternal()
-                triggerPrecachingInternal()
+        // Re-precache only when the appended track is one of the next ones Next plays. Under shuffle that
+        // is its distance in the shuffled order, not in the playlist; re-triggering on every append of a
+        // batch would cancel an in-flight extraction each time. The trigger keeps the precaches Next still
+        // reaches and releases the rest, so it needs no clear first (that threw away the next player).
+        val landsInPrecache =
+            if (internalShuffleModeEnabled) {
+                val gap =
+                    (shuffleIndices.getOrNull(playlist.lastIndex) ?: -1) -
+                        (shuffleIndices.getOrNull(localCurrentMediaItemIndex) ?: -1)
+                gap in 1..maxPrecacheCount
+            } else {
+                playlist.size - 1 - currentMediaItemIndex <= maxPrecacheCount
             }
+        if (landsInPrecache) {
+            coroutineScope.launch { triggerPrecachingInternal() }
         }
     }
 
@@ -637,11 +666,9 @@ class MpvPlayerAdapter(
 
             notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
 
-            if (index - 1 - currentMediaItemIndex <= maxPrecacheCount) {
-                coroutineScope.launch {
-                    clearPrecacheExceptCurrentInternal()
-                    triggerPrecachingInternal()
-                }
+            // Same as the append above: under shuffle the insert may reorder what Next plays.
+            if (internalShuffleModeEnabled || index - 1 - currentMediaItemIndex <= maxPrecacheCount) {
+                coroutineScope.launch { triggerPrecachingInternal() }
             }
         }
     }
@@ -954,16 +981,18 @@ class MpvPlayerAdapter(
                 }
         }
 
-    private fun getNextMediaItemIndex(): Int =
+    /** The index Next plays after [from]; [from] itself when nothing follows it. [from] defaults to the
+     *  current track, and precaching walks it forward to reach the track after next. */
+    private fun getNextMediaItemIndex(from: Int = localCurrentMediaItemIndex): Int =
         when (internalRepeatMode) {
             PlayerConstants.REPEAT_MODE_ALL -> {
                 if (internalShuffleModeEnabled && shuffleOrder.isNotEmpty()) {
-                    val currentShufflePos = shuffleIndices.getOrNull(localCurrentMediaItemIndex) ?: 0
+                    val currentShufflePos = shuffleIndices.getOrNull(from) ?: 0
                     val nextShufflePos = (currentShufflePos + 1) % shuffleOrder.size
-                    shuffleOrder.getOrNull(nextShufflePos) ?: localCurrentMediaItemIndex
+                    shuffleOrder.getOrNull(nextShufflePos) ?: from
                 } else {
-                    if (localCurrentMediaItemIndex < playlist.size - 1) {
-                        localCurrentMediaItemIndex + 1
+                    if (from < playlist.size - 1) {
+                        from + 1
                     } else {
                         0
                     }
@@ -971,15 +1000,15 @@ class MpvPlayerAdapter(
             }
             else -> {
                 if (internalShuffleModeEnabled && shuffleOrder.isNotEmpty()) {
-                    val currentShufflePos = shuffleIndices.getOrNull(localCurrentMediaItemIndex) ?: 0
+                    val currentShufflePos = shuffleIndices.getOrNull(from) ?: 0
                     val nextShufflePos = currentShufflePos + 1
                     if (nextShufflePos < shuffleOrder.size) {
-                        shuffleOrder.getOrNull(nextShufflePos) ?: localCurrentMediaItemIndex
+                        shuffleOrder.getOrNull(nextShufflePos) ?: from
                     } else {
-                        localCurrentMediaItemIndex
+                        from
                     }
                 } else {
-                    (localCurrentMediaItemIndex + 1).coerceAtMost(playlist.size - 1)
+                    (from + 1).coerceAtMost(playlist.size - 1)
                 }
             }
         }
@@ -1174,6 +1203,9 @@ class MpvPlayerAdapter(
         if (effects != AudioEffects.NONE) {
             setAudioEffects(effects, ensureReverbIr(effects))
         }
+        if (_eightDAvailable.value && eightDOrbit.snapshot().effect != null) {
+            if (!setEightD(eightDOrbit)) markEightDUnavailable()
+        }
         // And the output: a fresh handle opens the system default, so without this the next track
         // would quietly leave the device the user picked.
         preferredAudioDevice?.let { setAudioDevice(it) }
@@ -1273,6 +1305,50 @@ class MpvPlayerAdapter(
         }
     }
 
+    override fun setEightD(effect: EightDEffect?) {
+        val normalized = effect?.normalized()
+        coroutineScope.launch {
+            val previous = eightDOrbit.snapshot().effect
+            if (previous == normalized) return@launch
+            eightDCleanupJob?.cancel()
+            eightDOrbit.setEffect(normalized)
+            if (!_eightDAvailable.value) {
+                forEachLiveHandle { it.setEightD(null) }
+            } else if (normalized != null) {
+                // Switching on fades in, also inside a switch-off's fade; a retune does not.
+                var refused = false
+                forEachLiveHandle { if (!it.setEightD(eightDOrbit, fadeIn = previous == null)) refused = true }
+                if (refused) markEightDUnavailable()
+            } else if (previous != null) {
+                forEachLiveHandle { it.setEightD(eightDOrbit, fadeOutEffect = previous) }
+                eightDCleanupJob = coroutineScope.launch {
+                    delay(EightDEffect.TRANSITION_MS)
+                    if (eightDOrbit.snapshot().effect == null) {
+                        forEachLiveHandle { it.setEightD(null) }
+                    }
+                }
+            }
+        }
+    }
+
+    /** A refused filter is a fact about this libmpv: stop asking every handle; the other tiers stay. */
+    private fun markEightDUnavailable() {
+        _eightDAvailable.value = false
+        forEachLiveHandle { it.setEightD(null) }
+    }
+
+    /** 8D bookkeeping every listened-to handle needs: the first install, and the live phase after each seek. */
+    private open inner class EightDSyncListener : MpvPlayerEventAdapter() {
+        override fun restarted(player: MpvPlayer) = syncEightD(player)
+
+        override fun seeking(player: MpvPlayer) = syncEightD(player)
+
+        private fun syncEightD(player: MpvPlayer) {
+            // MpvPlayer ignores the call once released, so no ownership check is needed.
+            coroutineScope.launch { if (!player.syncEightD()) markEightDUnavailable() }
+        }
+    }
+
     /** @return the impulse response path for [effects], or null when there is no reverb to install. */
     private fun ensureReverbIr(effects: AudioEffects): String? = effects.reverb?.let { ReverbIrFiles.ensure(it.preset)?.absolutePath }
 
@@ -1300,6 +1376,27 @@ class MpvPlayerAdapter(
     /** The mpv device the user picked, or null for mpv's `auto` (the system default). */
     @Volatile
     private var preferredAudioDevice: String? = null
+
+    override suspend fun loadWaveform(
+        mediaId: String,
+        onProgress: (FloatArray) -> Unit,
+    ): FloatArray? {
+        if (mediaId.isBlank() || LiveStreamRegistry.isLive(mediaId)) return null
+        return MpvWaveformReader.read(mediaId, onProgress) { waveformSourceUrl(mediaId) }
+    }
+
+    /**
+     * The track's audio alone, found the way [extractPlayableUrl] finds it: a download first, then the
+     * format's own audio URL. No fallback extraction: a waveform is not worth another extraction.
+     */
+    private suspend fun waveformSourceUrl(videoId: String): String? {
+        File(getDownloadPath())
+            .listFiles()
+            ?.firstOrNull { it.name.contains(videoId) && !it.name.contains(MERGING_DATA_TYPE.VIDEO) && it.length() > 0 }
+            ?.let { return it.absolutePath }
+        val audioUrl = streamRepository.getNewFormat(videoId).lastOrNull()?.audioUrl?.takeIf { it.isNotEmpty() } ?: return null
+        return audioUrl.takeIf { streamRepository.is403Url(it).firstOrNull() == false }
+    }
 
     override fun selectAudioOutput(id: String?) {
         preferredAudioDevice = id?.takeIf { it != MPV_AUTO_DEVICE }
@@ -1343,6 +1440,8 @@ class MpvPlayerAdapter(
     // ========== Release Resources ==========
 
     override fun release() {
+        eightDCleanupJob?.cancel()
+        eightDOrbit.setPlaying(false)
         currentLoadJob?.cancel()
         precacheJob?.cancel()
         positionUpdateJob?.cancel()
@@ -1375,6 +1474,7 @@ class MpvPlayerAdapter(
 
         val oldState = internalState
         internalState = newState
+        eightDOrbit.setPlaying(newState == InternalState.PLAYING)
 
         Logger.d(TAG, "State transition: $oldState -> $newState (playWhenReady=$internalPlayWhenReady)")
 
@@ -1640,7 +1740,7 @@ class MpvPlayerAdapter(
         cleanupEventListenerInternal()
 
         val listener =
-            object : MpvPlayerEventAdapter() {
+            object : EightDSyncListener() {
                 override fun finished(player: MpvPlayer) {
                     Logger.d(TAG, "End of stream reached")
                     coroutineScope.launch {
@@ -1777,6 +1877,9 @@ class MpvPlayerAdapter(
                     if (isStalled != cachedIsLoading) {
                         Logger.w(TAG, "isLoading changed: $cachedIsLoading -> $isStalled")
                         cachedIsLoading = isStalled
+                        // A stall stops the audio but not the PLAYING state; the orbit must stop
+                        // with the audio, or the next handle joins ahead of what was heard.
+                        eightDOrbit.setPlaying(internalState == InternalState.PLAYING && !isStalled)
                         notifyListeners { onIsLoadingChanged(isStalled) }
                     }
                 }
@@ -1979,6 +2082,18 @@ class MpvPlayerAdapter(
 
                     Logger.d(TAG, "Starting crossfade to track $nextIndex ($nextVideoId)")
 
+                    // The placed transition, if the outgoing track is at its window. The end-of-file
+                    // path and a fade begun after a seek past the window get the plain fade from 0.
+                    val isAutoMode = crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO
+                    val plan =
+                        if (isAutoMode) {
+                            val outgoingVideoId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId ?: ""
+                            transitionPlan(outgoingVideoId, nextVideoId)?.startingAt(currentPlayer?.time ?: 0L)
+                        } else {
+                            null
+                        }
+                    val incomingStartMs = plan?.incomingStartMs ?: 0L
+
                     // Extract URL on IO thread (network), mpv native calls stay on service thread
                     val cachedPrecache = precachedPlayers.remove(nextVideoId)
                     val nextPlayer: MpvPlayer? =
@@ -1992,10 +2107,12 @@ class MpvPlayerAdapter(
                                 null
                             } else {
                                 createMediaPlayerInternal(nextSource)?.also { newPlayer ->
-                                    newPlayer.loadFile(buildPlaybackUrl(nextSource), startPaused = true)
+                                    newPlayer.loadFile(buildPlaybackUrl(nextSource), startPaused = true, startMs = incomingStartMs)
                                 }
                             }
                         }
+                    // A precached handle sits paused at 0; its cache already holds the intro.
+                    if (cachedPrecache?.player != null && incomingStartMs > 0) nextPlayer?.seekTo(incomingStartMs)
 
                     if (nextPlayer != null) {
                         // Setup secondary player with its OWN listener.
@@ -2003,7 +2120,7 @@ class MpvPlayerAdapter(
                         // the event listener from the current player (which is still playing).
                         secondaryPlayer = nextPlayer
                         nextPlayer.setEventListener(
-                            object : MpvPlayerEventAdapter() {
+                            object : EightDSyncListener() {
                                 override fun error(player: MpvPlayer) {
                                     Logger.e(TAG, "Secondary player error during crossfade")
                                     coroutineScope.launch {
@@ -2035,7 +2152,6 @@ class MpvPlayerAdapter(
                     crossfadeFromIndex = localCurrentMediaItemIndex
 
                     // AutoMix: load metadata and calculate parameters
-                    val isAutoMode = crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO
                     if (isAutoMode || djCrossfadeEnabled) {
                         loadAudioMetaIfNeeded(currentVideoId)
                         loadAudioMetaIfNeeded(nextVideoId)
@@ -2059,7 +2175,9 @@ class MpvPlayerAdapter(
 
                     // AutoMix: resolve duration and BPM ratio
                     val resolvedConfigDurationMs =
-                        if (isAutoMode) {
+                        if (plan != null) {
+                            plan.durationMs.toInt()
+                        } else if (isAutoMode) {
                             resolveAutoCrossfadeDurationMs(currentVideoId, nextVideoId)
                         } else {
                             crossfadeDurationMs
@@ -2088,6 +2206,7 @@ class MpvPlayerAdapter(
                     Logger.d(
                         TAG,
                         "Crossfade duration: configured=${resolvedConfigDurationMs}ms (auto=$isAutoMode), " +
+                            "placed=${plan ?: "no, from the start of the next track"}, " +
                             "bpmRatio=$bpmSpeedRatio, pitchRatio=$keyPitchRatio, " +
                             "actualRemaining=${actualTimeRemaining}ms, effective=${effectiveCrossfadeDurationMs}ms",
                     )
@@ -2420,6 +2539,66 @@ class MpvPlayerAdapter(
         val keyScale: String?,
     )
 
+    /**
+     * Measures the given tracks in the background, one at a time, through the waveform reader's single
+     * decode. Tidal's metadata is loaded first, so a plan is built from the tempo and key the fade will
+     * use. A failed measurement is tried again after [STRUCTURE_RETRY_MS], at most
+     * [STRUCTURE_MAX_ATTEMPTS] times a session; a job already running is left to finish.
+     */
+    private fun measureTrackStructures(vararg videoIds: String) {
+        if (structureJob?.isActive == true) return
+        val now = System.currentTimeMillis()
+        val wanted =
+            videoIds.filter { id ->
+                id.isNotBlank() &&
+                    !trackStructures.containsKey(id) &&
+                    !LiveStreamRegistry.isLive(id) &&
+                    (structureRetryAt[id] ?: 0L) <= now &&
+                    (structureAttempts[id] ?: 0) < STRUCTURE_MAX_ATTEMPTS
+            }
+        if (wanted.isEmpty()) return
+        structureJob =
+            coroutineScope.launch {
+                for (id in wanted) {
+                    loadAudioMetaIfNeeded(id)
+                    structureAttempts[id] = (structureAttempts[id] ?: 0) + 1
+                    structureRetryAt[id] = System.currentTimeMillis() + STRUCTURE_RETRY_MS
+                    val structure =
+                        try {
+                            MpvWaveformReader.structure(id) { waveformSourceUrl(id) }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Logger.w(TAG, "AutoMix: could not measure $id: ${e.message}")
+                            null
+                        } ?: continue
+                    trackStructures[id] = structure
+                }
+            }
+    }
+
+    /** Where the fade from [currentVideoId] into [nextVideoId] sits, once both are measured. */
+    private fun transitionPlan(
+        currentVideoId: String,
+        nextVideoId: String,
+    ): TransitionPlan? {
+        val outgoing = trackStructures[currentVideoId] ?: return null
+        val incoming = trackStructures[nextVideoId] ?: return null
+        val key = "$currentVideoId>$nextVideoId"
+        transitionPlans[key]?.let { return it }
+        if (key in pairsWithoutPlan) return null
+        val plan =
+            TransitionPlanner.plan(
+                outgoing,
+                incoming,
+                resolveAutoCrossfadeDurationMs(currentVideoId, nextVideoId).toLong(),
+                calculateBpmSpeedRatio(currentVideoId, nextVideoId),
+            )
+        if (plan != null) transitionPlans[key] = plan else pairsWithoutPlan.add(key)
+        Logger.d(TAG, "AutoMix plan $key: ${plan ?: "no clear drop, plain fade at the end"}")
+        return plan
+    }
+
     private suspend fun loadAudioMetaIfNeeded(videoId: String) {
         if (videoId.isBlank() || audioMetaCache.containsKey(videoId)) return
         try {
@@ -2561,6 +2740,8 @@ class MpvPlayerAdapter(
         private const val MIN_CROSSFADE_TRACK_MS = 20_000L
 
         private const val AUTO_FALLBACK_DURATION_MS = 30000
+        private const val STRUCTURE_RETRY_MS = 30_000L
+        private const val STRUCTURE_MAX_ATTEMPTS = 3
         private const val AUTO_MIN_DURATION_MS = 20000
         private const val AUTO_MAX_DURATION_MS = 45000
         private val BEAT_COUNT_OPTIONS = intArrayOf(8, 16, 24, 32, 40, 48, 64, 80, 96)
@@ -2820,15 +3001,28 @@ class MpvPlayerAdapter(
                                         val nextVideoId = playlist.getOrNull(getNextMediaItemIndex())?.mediaId
                                         val isPrecached = nextVideoId != null && precachedPlayers.containsKey(nextVideoId)
                                         val preparationBufferMs = if (isPrecached) 0L else 3000L
+                                        val isAutoMode = crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO
+                                        val currentVideoId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId ?: ""
+                                        if (isAutoMode) measureTrackStructures(currentVideoId, nextVideoId ?: "")
+                                        val plan = if (isAutoMode) transitionPlan(currentVideoId, nextVideoId ?: "") else null
                                         val resolvedDurationMs =
-                                            if (crossfadeDurationMs == DataStoreManager.CROSSFADE_DURATION_AUTO) {
-                                                val currentVideoId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId ?: ""
+                                            if (isAutoMode) {
                                                 resolveAutoCrossfadeDurationMs(currentVideoId, nextVideoId ?: "")
                                             } else {
                                                 crossfadeDurationMs
                                             }
                                         val triggerThreshold = resolvedDurationMs.toLong() + preparationBufferMs
-                                        if (timeRemaining in 1..triggerThreshold) {
+                                        // A placed fade starts when the outgoing track reaches its window,
+                                        // with no preparation lead: the incoming track must not start early,
+                                        // or its drop misses the phrase end. Past the window (a seek) it falls
+                                        // back to the end of the track.
+                                        val reached =
+                                            if (plan != null && pos < plan.outgoingEndMs) {
+                                                pos >= plan.outgoingStartMs
+                                            } else {
+                                                timeRemaining in 1..triggerThreshold
+                                            }
+                                        if (reached) {
                                             if (hasNextMediaItem()) {
                                                 val nextIndex = getNextMediaItemIndex()
                                                 triggerCrossfadeTransition(nextIndex)
@@ -2863,36 +3057,40 @@ class MpvPlayerAdapter(
         precacheJob =
             coroutineScope.launch {
                 try {
-                    val indicesToPrecache = mutableListOf<Int>()
-
-                    val index = localCurrentMediaItemIndex
+                    // The tracks Next will actually play, in Next's own order: shuffle-aware, wrapping
+                    // under Repeat All. Picking `index + i` in playlist order precached tracks a shuffled
+                    // queue never reached, and nothing released them until the queue was edited (#2619).
+                    // Read before the job first suspends, so an edit landing meanwhile cannot shift them.
+                    val targets = mutableListOf<GenericMediaItem>()
+                    var from = localCurrentMediaItemIndex
                     for (i in 1..maxPrecacheCount) {
-                        val nextIndex =
-                            when (internalRepeatMode) {
-                                PlayerConstants.REPEAT_MODE_ALL -> {
-                                    (index + i) % playlist.size
-                                }
-                                else -> {
-                                    val next = index + i
-                                    if (next < playlist.size) next else break
-                                }
-                            }
-
-                        val nextVideoId = playlist.getOrNull(nextIndex)?.mediaId
-                        // A live broadcast is not precached: buffered ahead, it would start behind
-                        // the live edge by however long it waited in the queue.
-                        if (nextIndex != localCurrentMediaItemIndex &&
-                            !precachedPlayers.containsKey(nextVideoId) &&
-                            nextVideoId?.let(LiveStreamRegistry::isLive) != true
-                        ) {
-                            indicesToPrecache.add(nextIndex)
-                        }
+                        val next = getNextMediaItemIndex(from)
+                        if (next == from || next == localCurrentMediaItemIndex) break
+                        playlist.getOrNull(next)?.let { targets += it }
+                        from = next
                     }
 
-                    for (idx in indicesToPrecache) {
+                    // Release every precache Next no longer reaches: the shuffle picks it skipped, the
+                    // tracks ahead of a Previous or a jump. The current track's entry stays: a trigger
+                    // can run between the index moving and that track's load taking its entry.
+                    val targetIds = targets.mapTo(HashSet()) { it.mediaId }
+                    val currentId = currentMediaItem?.mediaId
+                    precachedPlayers.entries.removeIf { (id, cached) ->
+                        val stale = id !in targetIds && id != currentId
+                        if (stale) cleanupPlayerInternal(cached.player)
+                        stale
+                    }
+
+                    for (mediaItem in targets) {
                         if (!isActive) break
 
-                        val mediaItem = playlist.getOrNull(idx) ?: continue
+                        // Checked here, not when the targets were picked: one track can be both targets
+                        // (a radio repeats songs), and a second insert would overwrite the first player
+                        // without releasing it. A live broadcast is not precached: buffered ahead, it
+                        // would start behind the live edge by however long it waited in the queue.
+                        if (precachedPlayers.containsKey(mediaItem.mediaId) || LiveStreamRegistry.isLive(mediaItem.mediaId)) {
+                            continue
+                        }
 
                         // Network extraction on IO, mpv native calls on the service thread
                         val source = withContext(Dispatchers.IO) { extractPlayableUrl(mediaItem) }
@@ -2904,16 +3102,16 @@ class MpvPlayerAdapter(
                                 // and additionally warms the demuxer cache.
                                 val player = createMediaPlayerInternal(source)
                                 if (player == null) {
-                                    Logger.w(TAG, "Precaching skipped for $idx: could not create mpv player")
+                                    Logger.w(TAG, "Precaching skipped for ${mediaItem.mediaId}: could not create mpv player")
                                 } else {
                                     player.applyPlaybackLevels()
                                     player.loadFile(buildPlaybackUrl(source), startPaused = true)
                                     precachedPlayers[mediaItem.mediaId] =
                                         PrecachedPlayer(player, mediaItem, source)
-                                    Logger.d(TAG, "Precached player for index $idx")
+                                    Logger.d(TAG, "Precached player for ${mediaItem.mediaId}")
                                 }
                             } catch (e: Exception) {
-                                Logger.e(TAG, "Precaching error for $idx: ${e.message}")
+                                Logger.e(TAG, "Precaching error for ${mediaItem.mediaId}: ${e.message}")
                             }
                         }
 
